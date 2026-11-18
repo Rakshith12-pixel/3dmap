@@ -1,0 +1,3 @@
+# Your real key lives here; never commit it
+config.js
+.DS_Store
