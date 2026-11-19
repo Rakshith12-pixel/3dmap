@@ -1,11 +1,8 @@
-// Udupi in 3D — Google Maps 3D (Map3DElement) + Places API (New).
+// Karnataka in 3D — Google Maps 3D (Map3DElement) + Places API (New).
+// Supports all 31 districts of Karnataka.
 
-const LANDMARKS = window.UDUPI_LANDMARKS;
-const CATS = window.UDUPI_CATEGORIES;
-
-// Udupi district, with a small margin.
-const DISTRICT = { north: 13.98, south: 13.05, east: 75.25, west: 74.55 };
-const HOME = { center: { lat: 13.3445, lng: 74.7655, altitude: 0 }, range: 5200, tilt: 58, heading: 20 };
+const DISTRICTS = window.KARNATAKA_DISTRICTS || [];
+const CATS = { ...(window.KARNATAKA_CATEGORIES || {}), ...(window.UDUPI_CATEGORIES || {}) };
 
 const DETAIL_FIELDS = [
   "displayName", "formattedAddress", "location", "rating", "userRatingCount",
@@ -37,10 +34,84 @@ const store = {
   del(k) { try { localStorage.removeItem(k); } catch {} },
   json(k, fallback) { try { return JSON.parse(localStorage.getItem(k)) ?? fallback; } catch { return fallback; } },
 };
-const KEY_STORE = "udupi3d.apiKey";
-const PLACE_CACHE = "udupi3d.placeCache.v1";
+const KEY_STORE = "karnataka3d.apiKey";
+const PLACE_CACHE = "karnataka3d.placeCache.v6";
 const placeCache = store.json(PLACE_CACHE, {});
 const saveCache = () => store.set(PLACE_CACHE, JSON.stringify(placeCache));
+
+// ---------- district state ----------
+const DISTRICT_ALIASES = {
+  "bengaluru": "bengaluru-urban",
+  "bangalore": "bengaluru-urban",
+  "bangalore-urban": "bengaluru-urban",
+  "bangalore-rural": "bengaluru-rural",
+  "blr": "bengaluru-urban",
+  "mysore": "mysuru",
+  "coorg": "kodagu",
+  "mangaluru": "dakshina-kannada",
+  "mangalore": "dakshina-kannada",
+  "dk": "dakshina-kannada",
+  "hampi": "vijayanagara",
+  "bellary": "ballari",
+  "belgaum": "belagavi",
+  "bijapur": "vijayapura",
+  "gulbarga": "kalaburagi",
+  "shimoga": "shivamogga",
+  "tumkur": "tumakuru",
+};
+
+const districtMap = new Map();
+function getDistrictMap() {
+  if (districtMap.size === 0 && Array.isArray(window.KARNATAKA_DISTRICTS)) {
+    for (const d of window.KARNATAKA_DISTRICTS) districtMap.set(d.id, d);
+  }
+  return districtMap;
+}
+
+function resolveDistrictId(id) {
+  if (!id) return "udupi";
+  const clean = String(id).trim().toLowerCase();
+  return DISTRICT_ALIASES[clean] || clean;
+}
+
+function getInitialDistrictId() {
+  const map = getDistrictMap();
+  const rawParam = new URLSearchParams(window.location.search).get("district");
+  if (rawParam) {
+    const resolved = resolveDistrictId(rawParam);
+    if (map.has(resolved) || DISTRICTS.some((d) => d.id === resolved)) {
+      return resolved;
+    }
+  }
+  const saved = store.get("karnataka3d.activeDistrict");
+  if (saved) {
+    const resolved = resolveDistrictId(saved);
+    if (map.has(resolved) || DISTRICTS.some((d) => d.id === resolved)) {
+      return resolved;
+    }
+  }
+  return "udupi";
+}
+
+function getDistrict(id) {
+  const map = getDistrictMap();
+  const canonId = resolveDistrictId(id);
+  return (
+    map.get(canonId) ||
+    DISTRICTS.find((d) => d.id === canonId) ||
+    map.get("udupi") ||
+    window.KARNATAKA_DISTRICTS?.[0] || {
+      id: "udupi",
+      name: "Udupi",
+      bounds: { north: 13.98, south: 13.05, east: 75.25, west: 74.55 },
+      home: { center: { lat: 13.3445, lng: 74.7655, altitude: 0 }, range: 5200, tilt: 58, heading: 20 },
+      landmarks: window.UDUPI_LANDMARKS || [],
+    }
+  );
+}
+
+let activeDistrictId = getInitialDistrictId();
+let currentDistrict = getDistrict(activeDistrictId);
 
 function toast(msg, ms = 3500) {
   const t = $("#toast");
@@ -57,21 +128,27 @@ function distM(a, b) {
 }
 const fmtDist = (m) => (m < 1000 ? `${Math.round(m)} m` : `${(m / 1000).toFixed(1)} km`);
 const ll = (p) => (p ? { lat: typeof p.lat === "function" ? p.lat() : p.lat, lng: typeof p.lng === "function" ? p.lng() : p.lng } : null);
-// Do two place names refer to the same thing? ("Malpe Beach" vs "Malpe Beach, Udupi")
-const STOP = new Set(["sri", "shri", "the", "of", "and", "temple", "udupi", "manipal", "&"]);
-const nameTokens = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter((w) => w.length > 2 && !STOP.has(w));
+
+const STOP = new Set(["sri", "shri", "the", "of", "and", "temple", "temples", "monument", "monuments", "site", "complex", "karnataka", "district", "road", "group", "unesco", "world", "heritage", "&"]);
+const stem = (w) => (w.endsWith("s") && w.length > 3 && !w.endsWith("ss") ? w.slice(0, -1) : w);
+const nameTokens = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter((w) => w.length > 2 && !STOP.has(w)).map(stem);
 function namesMatch(a, b) {
-  const ta = nameTokens(a.split("(")[0].split(",")[0]);
-  const tb = new Set(nameTokens(b));
+  const ta = nameTokens(String(a || "").split("(")[0].split(",")[0]);
+  const tb = new Set(nameTokens(String(b || "").split("(")[0].split(",")[0]));
   if (!ta.length || !tb.size) return false;
-  const hits = ta.filter((w) => tb.has(w)).length;
-  return hits >= Math.min(2, ta.length);
+  const hits = ta.filter((w) => tb.has(w));
+  if (hits.some((w) => w.length >= 4)) return true;
+  return hits.length >= Math.min(ta.length, tb.size, 2);
 }
 const prettyType = (t) => (t ? t.replace(/_/g, " ").replace(/^\w/, (c) => c.toUpperCase()) : "");
 
 // ---------- API key ----------
 function getKey() {
-  return (window.UDUPI_CONFIG?.apiKey || "").trim() || (store.get(KEY_STORE) || "").trim();
+  return (
+    (window.UDUPI_CONFIG?.apiKey || window.CONFIG?.apiKey || "").trim() ||
+    (store.get(KEY_STORE) || "").trim() ||
+    (store.get("udupi3d.apiKey") || "").trim()
+  );
 }
 function showSetup(errorMsg = "") {
   $("#setup").classList.remove("hidden");
@@ -89,14 +166,20 @@ $("#setup-form").addEventListener("submit", (e) => {
   location.reload();
 });
 $("#key-btn").addEventListener("click", () => {
-  if (window.UDUPI_CONFIG?.apiKey) { toast("The key is set in config.js. Edit that file to change it."); return; }
+  if (window.UDUPI_CONFIG?.apiKey || window.CONFIG?.apiKey) {
+    toast("The key is set in config.js. Edit that file to change it.");
+    return;
+  }
   store.del(KEY_STORE);
+  store.del("udupi3d.apiKey");
   location.reload();
 });
 
-// Google calls this when the key is rejected (wrong key, API not enabled, referrer not allowed).
 window.gm_authFailure = () => {
-  if (!window.UDUPI_CONFIG?.apiKey) store.del(KEY_STORE);
+  if (!window.UDUPI_CONFIG?.apiKey && !window.CONFIG?.apiKey) {
+    store.del(KEY_STORE);
+    store.del("udupi3d.apiKey");
+  }
   showSetup("Google rejected that key. Check that Maps JavaScript API and Places API (New) are enabled for it, and that http://localhost is an allowed referrer.");
 };
 
@@ -112,8 +195,95 @@ let exploreMarkers = [];
 let activeExplore = null;
 let touring = false;
 
+// ---------- district dropdown & switching ----------
+function buildDistrictSelect() {
+  const select = $("#district-select");
+  if (!select) return;
+  select.innerHTML = "";
+
+  const groups = {};
+  for (const d of DISTRICTS) {
+    const div = d.division || "Karnataka";
+    (groups[div] ||= []).push(d);
+  }
+
+  for (const [div, dists] of Object.entries(groups)) {
+    const optgroup = document.createElement("optgroup");
+    optgroup.label = div;
+    for (const d of dists) {
+      const opt = document.createElement("option");
+      opt.value = d.id;
+      opt.textContent = d.name;
+      if (d.id === activeDistrictId) opt.selected = true;
+      optgroup.append(opt);
+    }
+    select.append(optgroup);
+  }
+
+  select.addEventListener("change", (e) => {
+    setDistrict(e.target.value, { fly: true });
+  });
+}
+
+async function setDistrict(id, { fly = true } = {}) {
+  const dist = getDistrict(id);
+  if (!dist) return;
+  activeDistrictId = dist.id;
+  currentDistrict = dist;
+  store.set("karnataka3d.activeDistrict", dist.id);
+
+  // Update URL search query
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.set("district", dist.id);
+    window.history.replaceState({}, "", url);
+  } catch {}
+
+  // Update title & labels
+  const select = $("#district-select");
+  if (select && select.value !== dist.id) select.value = dist.id;
+
+  const titleEl = $("#district-title");
+  if (titleEl) titleEl.textContent = dist.name;
+  document.title = `${dist.name} in 3D — Karnataka`;
+
+  const homeBtn = $("#home-btn");
+  if (homeBtn) {
+    const shortName = dist.name.split(" ")[0].replace(/[^a-zA-Z]/g, "");
+    homeBtn.textContent = `⌂ ${shortName}`;
+    homeBtn.title = `Back to ${dist.name}`;
+  }
+
+  // Update autocomplete
+  updateSearchForDistrict(dist);
+
+  // Clear explore & details
+  clearExplore();
+  $("#details")?.classList.add("hidden");
+  setActiveListItem(null);
+
+  // Rebuild landmark list
+  buildLandmarkList();
+
+  // Update markers and fly
+  if (map) {
+    addLandmarkMarkers();
+    correctApproxLandmarks();
+    if (fly) {
+      await flyTo(dist.home.center, {
+        range: dist.home.range,
+        tilt: dist.home.tilt,
+        heading: dist.home.heading,
+      });
+    }
+  }
+}
+
 // ---------- boot ----------
-buildLandmarkList(); // works without Google, so the list shows even before a key is entered
+buildDistrictSelect();
+setDistrict(activeDistrictId, { fly: false });
+buildLandmarkList();
+
 const key = getKey();
 if (!key) showSetup();
 else start(key).catch((err) => {
@@ -132,14 +302,14 @@ async function start(key) {
   Marker3D = maps3d.Marker3DInteractiveElement || maps3d.Marker3DElement;
 
   map = new maps3d.Map3DElement({
-    ...HOME,
+    ...currentDistrict.home,
     mode: "HYBRID",
     gestureHandling: "GREEDY",
     language: "en",
   });
   $("#map-host").append(map);
   map.addEventListener("gmp-error", (e) => console.warn("Map3D error", e));
-  // Imagery (especially offshore) can take a few seconds; say so instead of showing a blank view.
+
   let loadTimer;
   map.addEventListener("gmp-steadychange", (e) => {
     clearTimeout(loadTimer);
@@ -147,7 +317,7 @@ async function start(key) {
     else loadTimer = setTimeout(() => $("#loading").classList.remove("hidden"), 1200);
   });
   map.addEventListener("gmp-click", onMapClick);
-  map.addEventListener("pointerdown", () => { lastTarget = null; if (touring) stopTour(); }); // the user is moving the camera
+  map.addEventListener("pointerdown", () => { lastTarget = null; if (touring) stopTour(); });
 
   addLandmarkMarkers();
   buildExploreChips();
@@ -159,66 +329,156 @@ async function start(key) {
 
 // ---------- camera ----------
 function camNow() {
-  const tilt = map.tilt ?? HOME.tilt, heading = map.heading ?? 0;
+  const home = currentDistrict.home;
+  const tilt = map.tilt ?? home.tilt, heading = map.heading ?? 0;
   const c = map.center;
-  // Over land, Google's reported centre is the point under the middle of the screen.
-  // Over the sea it can come back far away and deep below sea level, so in that case
-  // work out the look-at point ourselves from the camera position, heading and tilt.
   if (c && c.altitude > -300 && c.altitude < 9000) {
-    return { lat: c.lat, lng: c.lng, range: map.range ?? HOME.range, tilt, heading };
+    return { lat: c.lat, lng: c.lng, range: map.range ?? home.range, tilt, heading };
   }
   const cp = map.cameraPosition;
-  if (!cp) return { ...HOME.center, range: HOME.range, tilt, heading };
+  if (!cp) return { ...home.center, range: home.range, tilt, heading };
   const alt = Math.max(cp.altitude, 30);
   const t = (Math.min(tilt, 80) * Math.PI) / 180, h = (heading * Math.PI) / 180;
   const d = alt * Math.tan(t);
   const lat = cp.lat + (d * Math.cos(h)) / 111320;
   const lng = cp.lng + (d * Math.sin(h)) / (111320 * Math.cos((cp.lat * Math.PI) / 180));
-  // If we just flew to a place nearby, that is the true focus (sea level makes the estimate drift).
   if (lastTarget && distM(lastTarget, { lat, lng }) < 1500) return { ...lastTarget, range: lastTarget.range, tilt, heading };
   return { lat, lng, range: alt / Math.cos(t), tilt, heading };
 }
 let lastTarget = null;
-function flyTo(pos, { range = 650, tilt = 62, heading, duration = 2800 } = {}) {
+
+function calcSmoothDuration(fromPos, toPos, explicitDuration) {
+  if (typeof explicitDuration === "number" && explicitDuration > 0) return explicitDuration;
+  if (!fromPos?.lat || !toPos?.lat) return 4200;
+  const d = distM(fromPos, toPos); // distance in meters
+  if (d < 500) return 2600;       // within same block / neighborhood
+  if (d < 2500) return 3400;      // across town / city quarter
+  if (d < 12000) return 4200;     // across metro area
+  if (d < 60000) return 5000;     // within district / neighboring towns
+  if (d < 200000) return 5800;    // regional flight across multiple taluks
+  return 6600;                    // state-wide flight (e.g. coastal to Bengaluru / Deccan)
+}
+
+function flyTo(pos, { range = 900, tilt = 52, heading, duration, altitude = 35 } = {}) {
+  if (!map) return Promise.resolve();
   map.stopCameraAnimation?.();
-  lastTarget = { lat: pos.lat, lng: pos.lng, range };
+
+  const c = camNow();
+  const effectiveDuration = calcSmoothDuration(c, pos, duration);
+  const safeAlt = typeof pos.altitude === "number" && pos.altitude < 100 ? Math.max(pos.altitude, 15) : altitude;
+  lastTarget = { lat: pos.lat, lng: pos.lng, range, altitude: safeAlt };
+
   return new Promise((resolve) => {
-    const done = () => { map.removeEventListener("gmp-animationend", done); resolve(); };
+    let finished = false;
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      map.removeEventListener("gmp-animationend", done);
+      resolve();
+    };
     map.addEventListener("gmp-animationend", done);
-    map.flyCameraTo({
-      endCamera: { center: { lat: pos.lat, lng: pos.lng, altitude: 0 }, range, tilt, heading: heading ?? camNow().heading },
-      durationMillis: duration,
-    });
-    setTimeout(done, duration + 1500); // safety net
+
+    const endCamera = {
+      center: { lat: pos.lat, lng: pos.lng, altitude: safeAlt },
+      range,
+      tilt,
+      heading: heading ?? camNow().heading,
+      altitudeMode: "RELATIVE_TO_GROUND",
+    };
+
+    try {
+      map.flyCameraTo({
+        endCamera,
+        durationMillis: effectiveDuration,
+      });
+    } catch (err) {
+      console.warn("flyCameraTo failed with altitudeMode, retrying standard:", err);
+      try {
+        const { altitudeMode: _, ...plainEndCamera } = endCamera;
+        map.flyCameraTo({
+          endCamera: plainEndCamera,
+          durationMillis: effectiveDuration,
+        });
+      } catch (err2) {
+        console.warn("flyCameraTo direct fallback:", err2);
+        map.center = { lat: pos.lat, lng: pos.lng, altitude: safeAlt };
+        map.range = range;
+        map.tilt = tilt;
+        done();
+        return;
+      }
+    }
+    setTimeout(done, effectiveDuration + 1200);
   });
 }
-function orbit(pos, { range, tilt, seconds = 24 } = {}) {
+
+function orbit(pos, { range, tilt, seconds = 30, altitude = 35 } = {}) {
+  if (!map) return Promise.resolve();
   const c = camNow();
   const p = pos || c;
+  const safeAlt = typeof p.altitude === "number" && p.altitude < 100 ? Math.max(p.altitude, 15) : altitude;
+
   return new Promise((resolve) => {
-    const done = () => { map.removeEventListener("gmp-animationend", done); resolve(); };
+    let finished = false;
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      map.removeEventListener("gmp-animationend", done);
+      resolve();
+    };
     map.addEventListener("gmp-animationend", done);
-    map.flyCameraAround({
-      camera: { center: { lat: p.lat, lng: p.lng, altitude: 0 }, range: range ?? c.range, tilt: tilt ?? Math.max(c.tilt, 55), heading: c.heading },
-      durationMillis: seconds * 1000,
-      repeatCount: 1,
-    });
-    setTimeout(done, seconds * 1000 + 1500); // safety net
+
+    const camera = {
+      center: { lat: p.lat, lng: p.lng, altitude: safeAlt },
+      range: range ?? Math.max(c.range, 900),
+      tilt: tilt ?? Math.min(Math.max(c.tilt, 45), 56),
+      heading: c.heading,
+      altitudeMode: "RELATIVE_TO_GROUND",
+    };
+
+    try {
+      map.flyCameraAround({
+        camera,
+        durationMillis: seconds * 1000,
+        repeatCount: 1,
+      });
+    } catch (err) {
+      console.warn("flyCameraAround failed, retrying standard:", err);
+      try {
+        const { altitudeMode: _, ...plainCamera } = camera;
+        map.flyCameraAround({
+          camera: plainCamera,
+          durationMillis: seconds * 1000,
+          repeatCount: 1,
+        });
+      } catch (err2) {
+        console.warn("flyCameraAround direct fallback:", err2);
+        done();
+        return;
+      }
+    }
+    setTimeout(done, seconds * 1000 + 1200);
   });
 }
 
 // ---------- landmarks ----------
 function landmarkPos(lm) {
-  const c = placeCache[lm.id];
-  return c?.lat ? { lat: c.lat, lng: c.lng } : { lat: lm.lat, lng: lm.lng };
+  const cached = placeCache[lm.id];
+  if (cached?.lat && cached?.lng) {
+    return { lat: cached.lat, lng: cached.lng };
+  }
+  return { lat: lm.lat, lng: lm.lng };
 }
 
 function buildLandmarkList(filter = "") {
   const list = $("#landmark-list");
+  if (!list) return;
   const f = filter.trim().toLowerCase();
   list.innerHTML = "";
+  const lms = currentDistrict.landmarks || [];
+
   for (const [catId, cat] of Object.entries(CATS)) {
-    const items = LANDMARKS.filter((l) => l.cat === catId && (!f || (l.name + " " + l.blurb).toLowerCase().includes(f)));
+    const items = lms.filter((l) => l.cat === catId && (!f || (l.name + " " + (l.blurb || "")).toLowerCase().includes(f)));
     if (!items.length) continue;
     const g = document.createElement("div");
     g.className = "lm-group";
@@ -227,7 +487,7 @@ function buildLandmarkList(filter = "") {
       const b = document.createElement("button");
       b.className = "lm-item";
       b.dataset.id = lm.id;
-      b.innerHTML = `<b>${esc(lm.name)}</b><small>${esc(lm.blurb)}</small>`;
+      b.innerHTML = `<b>${esc(lm.name)}</b><small>${esc(lm.blurb || "")}</small>`;
       b.addEventListener("click", () => {
         if (!map) { showSetup(); return; }
         stopTour(); openLandmark(lm); closeSidebarMobile();
@@ -236,7 +496,9 @@ function buildLandmarkList(filter = "") {
     }
     list.append(g);
   }
-  if (!list.children.length) list.innerHTML = `<p class="hint">No landmark matches “${esc(filter)}”. Try the search box above to find any place on Google Maps.</p>`;
+  if (!list.children.length) {
+    list.innerHTML = `<p class="hint">No landmark matches “${esc(filter)}”. Try the search box above to find any place in ${esc(currentDistrict.name)}.</p>`;
+  }
 }
 
 function makePin(color, scale = 1) {
@@ -244,16 +506,27 @@ function makePin(color, scale = 1) {
   try { return new PinElement({ background: color, borderColor: "#ffffff", glyphColor: "#ffffff", scale }); } catch { return null; }
 }
 
+function clearLandmarkMarkers() {
+  for (const [, mk] of landmarkMarkers.entries()) {
+    try { mk.remove?.(); } catch {}
+  }
+  landmarkMarkers.clear();
+}
+
 function addLandmarkMarkers() {
-  for (const lm of LANDMARKS) {
+  if (!map) return;
+  clearLandmarkMarkers();
+  const lms = currentDistrict.landmarks || [];
+  for (const lm of lms) {
     const pos = landmarkPos(lm);
+    const catColor = CATS[lm.cat]?.color || "#E8833A";
     const mk = new Marker3D({
       position: { lat: pos.lat, lng: pos.lng, altitude: lm.featured ? 70 : 45 },
       altitudeMode: "RELATIVE_TO_GROUND",
       extruded: true,
       label: lm.name,
     });
-    const pin = makePin(CATS[lm.cat].color, lm.featured ? 1.25 : 1);
+    const pin = makePin(catColor, lm.featured ? 1.25 : 1);
     if (pin) mk.append(pin);
     mk.addEventListener("gmp-click", (e) => { e.stopPropagation?.(); stopTour(); openLandmark(lm); });
     map.append(mk);
@@ -268,24 +541,65 @@ function setActiveListItem(id) {
 const pendingLookups = {};
 function resolveLandmark(lm) {
   if (placeCache[lm.id]?.id) return Promise.resolve(placeCache[lm.id]);
-  // Share one in-flight lookup per landmark so repeated clicks don't repeat API calls.
   return (pendingLookups[lm.id] ||= lookupLandmark(lm).finally(() => delete pendingLookups[lm.id]));
 }
 async function lookupLandmark(lm) {
   try {
+    const isNature = lm.cat === "coast" || lm.cat === "nature";
+    const isSprawling = isNature || /\b(reservoir|lake|dam|sanctuary|betta|hill|gudda|peak|forest|falls)\b/i.test(lm.name);
+    const searchRadius = isSprawling ? 5000 : 3000;
+    const maxDist = isSprawling ? 6000 : 3500;
+
     const { places } = await Place.searchByText({
-      textQuery: lm.query,
-      fields: ["id", "displayName", "location"],
-      locationBias: { center: { lat: lm.lat, lng: lm.lng }, radius: lm.approx ? 5000 : 2000 },
-      maxResultCount: 1,
+      textQuery: lm.query || `${lm.name} ${currentDistrict.name}`,
+      fields: ["id", "displayName", "location", "types"],
+      locationBias: { center: { lat: lm.lat, lng: lm.lng }, radius: searchRadius },
+      maxResultCount: 5,
       region: "in",
     });
-    const p = places?.[0];
-    if (!p?.location) return null;
-    const loc = ll(p.location);
-    // Only trust the Google match if it's close to where we expect the landmark.
-    if (distM(loc, lm) > (lm.approx ? 6000 : 2500)) return null;
-    placeCache[lm.id] = { id: p.id, lat: loc.lat, lng: loc.lng };
+    if (!places?.length) return null;
+
+    // Filter to candidates within acceptable proximity of the curated site
+    const candidates = [];
+    for (const p of places) {
+      const loc = ll(p.location);
+      if (!loc) continue;
+      const d = distM(loc, lm);
+      if (d > maxDist) continue;
+
+      // Reject commercial lodging / eateries unless the landmark itself is in that category
+      const pName = (p.displayName || "").toLowerCase();
+      const pTypes = p.types || [];
+      const isFoodOrStay = /\b(hotel|restaurant|resort|lodge|residency|dhaba|boarding|rooms|inn|homestay|bar|bhojanalaya)\b/i.test(pName) ||
+        pTypes.some((t) => ["lodging", "restaurant", "food", "cafe", "bar"].includes(t));
+      if (isFoodOrStay && lm.cat !== "city") continue;
+
+      candidates.push({ place: p, loc, dist: d });
+    }
+    if (!candidates.length) return null;
+
+    // Rank candidates by name similarity and proximity
+    let best = null;
+    let bestScore = -1;
+    for (const cand of candidates) {
+      const nameMatch = namesMatch(lm.name, cand.place.displayName) ? 3 : 0;
+      const queryMatch = namesMatch(lm.query || "", cand.place.displayName) ? 2 : 0;
+      const distScore = Math.max(0, 1 - cand.dist / maxDist);
+      const score = nameMatch + queryMatch + distScore;
+      if (score > bestScore) {
+        bestScore = score;
+        best = cand;
+      }
+    }
+
+    // Only accept if there is reasonable name alignment
+    if (!best || bestScore < 1.0) {
+      console.warn("No confident Places match for", lm.name);
+      return null;
+    }
+
+    // Cache verified Google Place ID and pinpoint coordinates
+    placeCache[lm.id] = { id: best.place.id, lat: best.loc.lat, lng: best.loc.lng };
     saveCache();
     return placeCache[lm.id];
   } catch (err) {
@@ -294,11 +608,11 @@ async function lookupLandmark(lm) {
   }
 }
 
-// Landmarks whose position we only know roughly get snapped to Google's location once.
 async function correctApproxLandmarks() {
-  for (const lm of LANDMARKS.filter((l) => l.approx && !placeCache[l.id])) {
-    const r = await resolveLandmark(lm);
-    if (r) {
+  const lms = currentDistrict.landmarks || [];
+  for (const lm of lms) {
+    const r = placeCache[lm.id];
+    if (r?.lat && r?.lng) {
       const mk = landmarkMarkers.get(lm.id);
       if (mk) mk.position = { lat: r.lat, lng: r.lng, altitude: lm.featured ? 70 : 45 };
     }
@@ -308,15 +622,31 @@ async function correctApproxLandmarks() {
 async function openLandmark(lm, { fly = true } = {}) {
   setActiveListItem(lm.id);
   renderDetails({ landmark: lm, loading: true });
-  // Look up Google's exact position first (cached after the first time), then fly once.
-  // Two overlapping camera flights can leave the 3D camera in a broken state.
-  const timeout = new Promise((res) => setTimeout(() => res(null), 2000));
-  const r = await Promise.race([resolveLandmark(lm), timeout]);
-  if (fly) flyTo(r?.lat ? r : landmarkPos(lm), { range: lm.cat === "coast" ? 1400 : 650 });
-  if (r?.lat) { const mk = landmarkMarkers.get(lm.id); if (mk) mk.position = { lat: r.lat, lng: r.lng, altitude: lm.featured ? 70 : 45 }; }
-  const rr = r || (await resolveLandmark(lm)); // if the lookup was slow, wait for it for the details
+
+  const isNature = lm.cat === "coast" || lm.cat === "nature";
+  const isHillOrFort = isNature ||
+    /\b(fort|betta|hill|gudda|peak|parvatha|valley|canyon|reservoir|dam|falls|sanctuary)\b/i.test(lm.name);
+  const targetRange = isHillOrFort ? 1400 : (lm.featured ? 1050 : 850);
+  const targetTilt = isHillOrFort ? 48 : 52;
+
+  let targetPos = landmarkPos(lm);
+  if (fly) flyTo(targetPos, { range: targetRange, tilt: targetTilt, altitude: 35 });
+
+  const r = await resolveLandmark(lm);
+  if (r?.lat && r?.lng) {
+    const newPos = { lat: r.lat, lng: r.lng };
+    const mk = landmarkMarkers.get(lm.id);
+    if (mk) {
+      mk.position = { lat: newPos.lat, lng: newPos.lng, altitude: lm.featured ? 70 : 45 };
+    }
+    // If the precise Google Place pin differs by more than 15 meters, center camera directly on it
+    if (fly && distM(targetPos, newPos) > 15) {
+      flyTo(newPos, { range: targetRange, tilt: targetTilt, altitude: 35, duration: 1000 });
+    }
+  }
+
   let place = null;
-  if (rr?.id) place = await fetchDetails(new Place({ id: rr.id }));
+  if (r?.id) place = await fetchDetails(new Place({ id: r.id }));
   renderDetails({ landmark: lm, place });
 }
 
@@ -337,13 +667,13 @@ async function openPlace(place, { fly = true } = {}) {
   const p = await fetchDetails(place);
   if (!p) { renderDetails({ error: "Couldn't load details for this place." }); return; }
   const loc = ll(p.location);
-  // If this Google place is one of our curated landmarks, show the extra history too.
-  const lm = LANDMARKS.find((l) => placeCache[l.id]?.id === p.id)
-    || (loc && LANDMARKS.find((l) => distM(loc, landmarkPos(l)) < 40))
-    || (loc && LANDMARKS.find((l) => distM(loc, landmarkPos(l)) < 800 && namesMatch(l.name, p.displayName)));
+  const lms = currentDistrict.landmarks || [];
+  const lm = lms.find((l) => placeCache[l.id]?.id === p.id)
+    || (loc && lms.find((l) => distM(loc, landmarkPos(l)) < 40))
+    || (loc && lms.find((l) => distM(loc, landmarkPos(l)) < 800 && namesMatch(l.name, p.displayName)));
   if (fly && loc) {
     const c = camNow();
-    flyTo(loc, { range: Math.min(Math.max(c.range, 350), 900), duration: 1800 });
+    flyTo(loc, { range: Math.min(Math.max(c.range, 650), 1050), tilt: 52, duration: 1800, altitude: 30 });
   }
   renderDetails({ landmark: lm, place: p });
 }
@@ -359,7 +689,7 @@ function renderDetails({ landmark: lm, place: p, loading, error, title, html }) 
   const cat = lm ? CATS[lm.cat] : null;
   const name = lm?.name || p?.displayName || title || "";
   const photos = (p?.photos || []).slice(0, 8);
-  const loc = ll(p?.location) || (lm ? landmarkPos(lm) : null);
+  const loc = (lm ? landmarkPos(lm) : null) || ll(p?.location);
 
   let out = "";
   if (photos.length) {
@@ -406,8 +736,8 @@ function renderDetails({ landmark: lm, place: p, loading, error, title, html }) 
       <a class="btn" href="https://www.google.com/maps/dir/?api=1&destination=${loc.lat},${loc.lng}" target="_blank" rel="noopener">Directions</a>
     </div>`;
   }
-  if (lm && loc) out += landRecordsBlock(loc);
-  if (p) out += `<p class="d-src">Photos, ratings and hours from Google Maps.${lm ? " History and ownership notes curated for this site from the linked public sources." : ""}</p>`;
+  if (loc) out += landRecordsBlock(loc);
+  if (p) out += `<p class="d-src">Photos, ratings and hours from Google Maps.${lm ? " History and notes curated for this site." : ""}</p>`;
   out += `</div>`;
   body.innerHTML = out;
 
@@ -419,12 +749,13 @@ function renderDetails({ landmark: lm, place: p, loading, error, title, html }) 
     body.querySelectorAll(".d-strip img").forEach((x) => x.classList.toggle("on", x === img));
   }));
   $("#d-orbit")?.addEventListener("click", () => {
-    flyTo(loc, { range: lm?.cat === "coast" ? 1400 : 600, duration: 1500 }).then(() => orbit(loc));
+    const isNature = lm?.cat === "coast" || lm?.cat === "nature";
+    const range = isNature ? 1400 : 900;
+    flyTo(loc, { range, tilt: 52, duration: 1500, altitude: 35 }).then(() => orbit(loc, { range, tilt: 52, altitude: 35 }));
   });
   $("#d-street")?.addEventListener("click", () => showStreetView(loc));
 }
 
-// Who owns or runs a landmark (institutions only), with the public sources it came from.
 function ownerBlock(o) {
   const src = (o.src || []).map((x) => `<a href="${esc(x.url)}" target="_blank" rel="noopener">${esc(x.label)}</a>`).join(" · ");
   return `<div class="d-owner">
@@ -435,16 +766,16 @@ function ownerBlock(o) {
   </div>`;
 }
 
-// Links to the Government of Karnataka's official land-record services, for looking up one property.
 function landRecordsBlock(loc) {
   const link = (href, label) => `<a class="btn" href="${href}" target="_blank" rel="noopener">${label} ↗</a>`;
+  const distName = currentDistrict?.name || "Karnataka";
   return `<details class="d-land">
     <summary>Land records (Government of Karnataka)</summary>
     <p>Spot: <b>${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)}</b>. To look up this property's official record:</p>
     <ol>
       <li>Open the <b>Dishaank</b> app at this spot to get its survey number.</li>
-      <li>Enter it on <b>Bhoomi</b> (View RTC: Udupi district, then taluk, hobli, village) to see the record of rights.</li>
-      <li>For registered sales and mortgages, use <b>Kaveri 2.0</b>. Town properties are recorded with the city council (<b>e-Aasthi</b>).</li>
+      <li>Enter it on <b>Bhoomi</b> (View RTC: ${esc(distName)} district, then taluk, hobli, village) to see the record of rights.</li>
+      <li>For registered sales and mortgages, use <b>Kaveri 2.0</b>. Town properties are recorded with the local municipal council (<b>e-Aasthi</b>).</li>
     </ol>
     <div class="d-actions">
       ${link("https://mapps.mgov.gov.in/details?appid=2100", "Dishaank app")}
@@ -463,8 +794,6 @@ function photoAttr(ph) {
   return a.uri ? `Photo: <a href="${esc(a.uri)}" target="_blank" rel="noopener">${n}</a>` : `Photo: ${n}`;
 }
 
-// Street View opens in Google Maps itself: it works with every key (including the
-// free Demo Key, which can't embed Street View) and shows the real street-level photos.
 function showStreetView(loc) {
   window.open(`https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${loc.lat},${loc.lng}`, "_blank", "noopener");
 }
@@ -473,7 +802,7 @@ function showStreetView(loc) {
 async function onMapClick(e) {
   if (touring) stopTour();
   if (e.placeId) {
-    e.preventDefault(); // we show our own panel instead of Google's popover
+    e.preventDefault();
     try {
       const place = await e.fetchPlace();
       openPlace(place, { fly: false });
@@ -490,11 +819,12 @@ async function whatsHere(pos) {
   setActiveListItem(null);
   renderDetails({ html: `<div class="d-main"><div class="d-cat">This spot</div><h2 class="d-title">${pos.lat.toFixed(5)}, ${pos.lng.toFixed(5)}</h2><p class="d-loading">Finding nearby buildings and businesses…</p></div>` });
   let places = [];
+  const radius = 250;
   try {
     const res = await Place.searchNearby({
       fields: ["id", "displayName", "location", "primaryType", "types", "formattedAddress"],
-      locationRestriction: { center: pos, radius: 150 },
-      maxResultCount: 12,
+      locationRestriction: { center: pos, radius },
+      maxResultCount: 20,
       rankPreference: google.maps.places.SearchNearbyRankPreference?.DISTANCE ?? "DISTANCE",
     });
     places = res.places || [];
@@ -503,9 +833,9 @@ async function whatsHere(pos) {
   const gmaps = `https://www.google.com/maps/search/?api=1&query=${pos.lat},${pos.lng}`;
   let html = `<div class="d-main"><div class="d-cat">This spot</div><h2 class="d-title">${pos.lat.toFixed(5)}, ${pos.lng.toFixed(5)}</h2>`;
   html += places.length
-    ? `<p class="d-blurb">${places.length} place${places.length > 1 ? "s" : ""} on Google Maps within 150 m:</p><div class="near-list">${places.map((p, i) => `
+    ? `<p class="d-blurb">${places.length} place${places.length > 1 ? "s" : ""} on Google Maps within ${radius} m:</p><div class="near-list">${places.map((p, i) => `
         <button class="near-item" data-i="${i}"><span><b>${esc(p.displayName)}</b><small>${esc(prettyType(p.primaryType || p.types?.[0]))}</small></span><span class="dist">${fmtDist(distM(pos, ll(p.location)))}</span></button>`).join("")}</div>`
-    : `<p class="d-blurb">Google Maps lists no businesses or landmarks within 150 m of this spot.</p>`;
+    : `<p class="d-blurb">Google Maps lists no businesses or landmarks within ${radius} m of this spot.</p>`;
   html += `<div class="d-actions"><button class="btn" id="d-street">Street View ↗</button><a class="btn" href="${gmaps}" target="_blank" rel="noopener">Open in Google Maps</a></div></div>`;
   renderDetails({ html });
   $("#details-body").querySelectorAll(".near-item").forEach((b) => b.addEventListener("click", () => openPlace(places[+b.dataset.i])));
@@ -515,6 +845,7 @@ async function whatsHere(pos) {
 // ---------- explore nearby (shops, restaurants, …) ----------
 function buildExploreChips() {
   const wrap = $("#explore-chips");
+  wrap.innerHTML = "";
   for (const ex of EXPLORE) {
     const b = document.createElement("button");
     b.className = "chip";
@@ -538,28 +869,50 @@ async function toggleExplore(ex, chip) {
   activeExplore = ex;
   chip.classList.add("on");
   const c = camNow();
-  const radius = Math.round(Math.min(Math.max(c.range * 0.7, 400), 5000));
+  const radius = Math.round(Math.min(Math.max(c.range * 0.8, 500), 8000));
   $("#explore-status").textContent = `Searching ${ex.label.toLowerCase()} within ${fmtDist(radius)} of the view centre…`;
   try {
-    const { places } = await Place.searchNearby({
-      fields: ["id", "displayName", "location", "primaryType", "types", "rating"],
-      locationRestriction: { center: { lat: c.lat, lng: c.lng }, radius },
-      includedTypes: ex.types,
-      maxResultCount: 20,
-    });
+    // If the category has multiple types, split into two queries to fetch up to 35-40 locations
+    const typeBatches = ex.types.length > 2
+      ? [ex.types.slice(0, 2), ex.types.slice(2)]
+      : [ex.types];
+
+    const results = await Promise.all(typeBatches.map((types) =>
+      Place.searchNearby({
+        fields: ["id", "displayName", "location", "primaryType", "types", "rating"],
+        locationRestriction: { center: { lat: c.lat, lng: c.lng }, radius },
+        includedTypes: types,
+        maxResultCount: 20,
+      }).then((r) => r.places || []).catch(() => [])
+    ));
+
     if (activeExplore !== ex) return;
-    for (const p of places || []) {
+
+    // Deduplicate by place ID
+    const seen = new Set();
+    const places = [];
+    for (const batch of results) {
+      for (const p of batch) {
+        if (p.id && !seen.has(p.id)) {
+          seen.add(p.id);
+          places.push(p);
+        }
+      }
+    }
+
+    for (const p of places) {
       const loc = ll(p.location);
+      if (!loc) continue;
       const mk = new Marker3D({ position: { lat: loc.lat, lng: loc.lng, altitude: 25 }, altitudeMode: "RELATIVE_TO_GROUND", extruded: true, label: p.displayName });
-      const pin = makePin("#E0457B", 0.8); // distinct from landmark category colours
+      const pin = makePin("#E0457B", 0.8);
       if (pin) mk.append(pin);
       mk.addEventListener("gmp-click", (e) => { e.stopPropagation?.(); openPlace(p, { fly: false }); });
       map.append(mk);
       exploreMarkers.push(mk);
     }
-    const n = places?.length || 0;
+    const n = places.length;
     $("#explore-status").textContent = n
-      ? `${n} ${ex.label.toLowerCase()} shown${n === 20 ? " (the 20 closest; zoom in or move to see others)" : ""}. Click a pin for details.`
+      ? `${n} ${ex.label.toLowerCase()} located. Click any pin for 3D view and details.`
       : `No ${ex.label.toLowerCase()} found here. Move the map and try again.`;
   } catch (err) {
     console.warn(err);
@@ -569,18 +922,26 @@ async function toggleExplore(ex, chip) {
 
 // ---------- search ----------
 function buildSearch(places) {
+  updateSearchForDistrict(currentDistrict, places);
+}
+
+function updateSearchForDistrict(dist, placesLib) {
   const slot = $("#search-slot");
-  const Ctor = places.PlaceAutocompleteElement;
+  if (!slot) return;
+  const places = placesLib || window.google?.maps?.places;
+  const Ctor = places?.PlaceAutocompleteElement;
   if (!Ctor) return;
+
+  slot.innerHTML = "";
   let ac;
   try {
-    ac = new Ctor({ locationRestriction: DISTRICT, includedRegionCodes: ["in"] });
+    ac = new Ctor({ locationRestriction: dist.bounds, includedRegionCodes: ["in"] });
   } catch {
     ac = new Ctor({});
   }
-  ac.setAttribute("placeholder", "Search any shop, building or address in Udupi");
+  ac.setAttribute("placeholder", `Search any place, shop or building in ${dist.name}`);
   slot.append(ac);
-  // Newer API: gmp-select with placePrediction. Older: gmp-placeselect with place.
+
   ac.addEventListener("gmp-select", async (ev) => {
     const place = ev.placePrediction?.toPlace ? ev.placePrediction.toPlace() : ev.place;
     if (place) { stopTour(); openPlace(place); closeSidebarMobile(); }
@@ -594,12 +955,19 @@ function wireControls() {
     map.mode = b.dataset.mode;
     document.querySelectorAll(".seg button").forEach((x) => x.classList.toggle("on", x === b));
   }));
-  $("#home-btn").addEventListener("click", () => { stopTour(); flyTo(HOME.center, { range: HOME.range, tilt: HOME.tilt, heading: HOME.heading }); });
+  $("#home-btn").addEventListener("click", () => {
+    stopTour();
+    flyTo(currentDistrict.home.center, {
+      range: currentDistrict.home.range,
+      tilt: currentDistrict.home.tilt,
+      heading: currentDistrict.home.heading,
+    });
+  });
   $("#orbit-btn").addEventListener("click", () => { stopTour(); orbit(); });
   $("#topdown-btn").addEventListener("click", () => {
     stopTour();
     const c = camNow();
-    flyTo(c, { range: c.range, tilt: c.tilt > 20 ? 0 : 60, heading: c.heading, duration: 900 });
+    flyTo(c, { range: c.range, tilt: c.tilt > 20 ? 0 : 52, heading: c.heading, duration: 1600 });
   });
   $("#details-close").addEventListener("click", () => { $("#details").classList.add("hidden"); setActiveListItem(null); });
   $("#lm-filter").addEventListener("input", (e) => buildLandmarkList(e.target.value));
@@ -607,8 +975,11 @@ function wireControls() {
   $("#help-btn").addEventListener("click", () => $("#help").classList.remove("hidden"));
   document.querySelectorAll(".modal [data-close]").forEach((b) => b.addEventListener("click", () => b.closest(".modal").classList.add("hidden")));
   $("#help").addEventListener("click", (e) => { if (e.target.id === "help") e.target.classList.add("hidden"); });
-  if (store.get("udupi3d.noteSeen")) $("#note").classList.add("hidden");
-  $("#note-close").addEventListener("click", () => { $("#note").classList.add("hidden"); store.set("udupi3d.noteSeen", "1"); });
+  if (store.get("udupi3d.noteSeen") || store.get("karnataka3d.noteSeen")) $("#note").classList.add("hidden");
+  $("#note-close").addEventListener("click", () => {
+    $("#note").classList.add("hidden");
+    store.set("karnataka3d.noteSeen", "1");
+  });
   $("#sidebar-open").addEventListener("click", () => $("#sidebar").classList.add("open"));
   $("#sidebar-close").addEventListener("click", closeSidebarMobile);
 }
@@ -629,7 +1000,7 @@ function wireKeyboard() {
     if (touring) stopTour();
     if (!held.size && !tapped.size) { map.stopCameraAnimation?.(); last = performance.now(); requestAnimationFrame(step); }
     held.add(k);
-    tapped.add(k); // so a quick tap still moves the camera a little
+    tapped.add(k);
   });
   document.addEventListener("keyup", (e) => held.delete(e.key.toLowerCase()));
   window.addEventListener("blur", () => held.clear());
@@ -643,7 +1014,7 @@ function wireKeyboard() {
     const dt = Math.max(Math.min((t - last) / 1000, 0.1), tapOnly ? 0.12 : 0);
     last = t;
     const c = camNow();
-    const speed = c.range * 0.9 * dt; // metres this frame, scales with zoom
+    const speed = c.range * 0.9 * dt;
     let fwd = 0, side = 0;
     if (active.has("w") || active.has("arrowup")) fwd += 1;
     if (active.has("s") || active.has("arrowdown")) fwd -= 1;
@@ -662,7 +1033,7 @@ function wireKeyboard() {
     const lat = c.lat + north / 111320;
     const lng = c.lng + east / (111320 * Math.cos((c.lat * Math.PI) / 180));
     map.center = { lat, lng, altitude: 0 };
-    lastTarget = { lat, lng, range }; // keep our own focus exact (Google's can drift over the sea)
+    lastTarget = { lat, lng, range };
     map.heading = (heading + 360) % 360;
     map.tilt = tilt;
     map.range = range;
@@ -676,15 +1047,20 @@ async function startTour() {
   const me = ++tourId;
   touring = true;
   $("#tour-btn").textContent = "■ Stop tour";
-  const stops = LANDMARKS.filter((l) => l.featured);
-  for (const lm of stops) {
+  const stops = (currentDistrict.landmarks || []).filter((l) => l.featured);
+  const tourList = stops.length ? stops : (currentDistrict.landmarks || []).slice(0, 5);
+  for (const lm of tourList) {
     if (me !== tourId) return;
     openLandmark(lm, { fly: false });
     const pos = landmarkPos(lm);
-    const range = lm.cat === "coast" ? 1500 : 700;
-    await flyTo(pos, { range, tilt: 62, duration: 4000 });
+    const isNature = lm.cat === "coast" || lm.cat === "nature";
+    const isHillOrFort = isNature ||
+      /\b(fort|betta|hill|gudda|peak|parvatha|valley|canyon|reservoir|dam|falls|sanctuary)\b/i.test(lm.name);
+    const range = isHillOrFort ? 1400 : (lm.featured ? 1050 : 900);
+    const tilt = isHillOrFort ? 48 : 52;
+    await flyTo(pos, { range, tilt, duration: 3500, altitude: 35 });
     if (me !== tourId) return;
-    await orbit(pos, { range, tilt: 62, seconds: 14 });
+    await orbit(pos, { range, tilt, seconds: 14, altitude: 35 });
   }
   if (me === tourId) stopTour();
 }
